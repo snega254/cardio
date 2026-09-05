@@ -10,6 +10,9 @@ Design notes:
   - `self.features` is the conv stack; kept as a named attribute so
     gradcam.py can hook the last conv layer's activations/gradients.
   - Global average pooling + linear head for classification.
+  - Dropout raised to 0.5 (from 0.3) to address overfitting observed
+    during training (val_loss rising while train_loss kept falling
+    in later epochs).
 """
 
 import torch
@@ -52,7 +55,7 @@ class CNN1D(nn.Module):
         self.global_pool = nn.AdaptiveAvgPool1d(1)
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.5),
             nn.Linear(256, 128),
             nn.ReLU(inplace=True),
             nn.Linear(128, num_classes),

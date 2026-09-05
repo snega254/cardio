@@ -78,8 +78,11 @@ def train_model(
     train_ds = PTBXLDataset(ptbxl_root, split="train", sampling_rate=sampling_rate)
     val_ds = PTBXLDataset(ptbxl_root, split="val", sampling_rate=sampling_rate)
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=2)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=2)
+    # num_workers=0 avoids Windows spawn-based multiprocessing pickling
+    # errors when the Dataset holds large in-memory arrays (eager-loaded
+    # in PTBXLDataset.__init__). Safe default for CPU-only training.
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
 
     model_cls = MODEL_REGISTRY[model_name]
     model = model_cls(
@@ -87,7 +90,9 @@ def train_model(
     ).to(device)
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    # weight_decay adds L2 regularization to combat overfitting
+    # (observed as val_loss rising while train_loss kept falling).
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=3
     )
