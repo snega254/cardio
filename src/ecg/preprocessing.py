@@ -8,6 +8,12 @@ the model:
   3. Reduce the standard 12 leads down to the 8 independent leads
      (I, II, V1-V6) — III, aVR, aVL, aVF are linear combinations of
      I and II and carry no extra information for the model.
+
+FIX LOG:
+  - reduce_to_8_leads() now accepts BOTH 8-lead and 12-lead input.
+    Previously it assumed 12 leads and crashed with
+    "IndexError: index 8 is out of bounds for axis 1 with size 8"
+    when the caller passed an already-reduced 8-lead signal.
 """
 
 import numpy as np
@@ -68,13 +74,38 @@ def reduce_to_8_leads(signal: np.ndarray) -> np.ndarray:
     """
     Drop III, aVR, aVL, aVF — keep I, II, V1-V6.
 
+    Handles two cases:
+      - 12-lead input → reduce to 8 via KEEP_INDICES
+      - 8-lead input  → return as-is (already reduced)
+
+    This makes the function idempotent: calling it twice is safe,
+    and it will not crash if an upstream step has already reduced
+    the signal from 12 leads to 8.
+
     Args:
-        signal: (n_samples, 12), in LEAD_ORDER.
+        signal: (n_samples, 12) OR (n_samples, 8)
 
     Returns:
         (n_samples, 8)
+
+    Raises:
+        ValueError: if the signal has any other number of leads.
     """
-    return signal[:, KEEP_INDICES]
+    n_leads = signal.shape[1]
+
+    # Case 1: already reduced to 8 leads — no-op
+    if n_leads == 8:
+        return signal
+
+    # Case 2: full 12-lead input — reduce using KEEP_INDICES
+    if n_leads == 12:
+        return signal[:, KEEP_INDICES]
+
+    # Anything else is a bug upstream
+    raise ValueError(
+        f"reduce_to_8_leads expected 8 or 12 leads, got {n_leads}. "
+        f"Check the shape of the signal entering preprocess_signal()."
+    )
 
 
 def preprocess_signal(
@@ -84,8 +115,13 @@ def preprocess_signal(
     Full pipeline used everywhere else in the codebase: filter ->
     reduce leads -> normalize.
 
+    Accepts either 12-lead or 8-lead input:
+      - 12-lead → filtered → reduced to 8 → normalized
+      - 8-lead  → filtered → returned as-is (already reduced) → normalized
+
     Args:
-        signal: raw (n_samples, 12) as returned by data_loader.
+        signal: raw (n_samples, 12) OR (n_samples, 8)
+        fs: sampling rate in Hz
 
     Returns:
         (n_samples, 8), filtered and normalized, ready for the model.
@@ -98,7 +134,7 @@ def preprocess_signal(
 
 def preprocess_batch(signals: np.ndarray, fs: int = 100) -> np.ndarray:
     """
-    Apply preprocess_signal to a batch of shape (n, n_samples, 12).
-    Returns (n, n_samples, 8).
+    Apply preprocess_signal to a batch of shape (n, n_samples, 12)
+    or (n, n_samples, 8). Returns (n, n_samples, 8).
     """
     return np.stack([preprocess_signal(s, fs=fs) for s in signals], axis=0)

@@ -17,6 +17,8 @@ Metrics computed per model:
 import argparse
 import json
 import os
+from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 import torch
@@ -111,6 +113,65 @@ def compute_metrics(y_true: np.ndarray, y_probs: np.ndarray) -> dict:
         },
         "accuracy": float(report["accuracy"]),
     }
+
+
+def evaluate_image_classifier(
+    image_paths: Sequence[str],
+    labels: Sequence[str],
+    output_path: str | None = None,
+) -> dict:
+    """Evaluate the complete image-extraction plus classifier pipeline.
+
+    ``labels`` must contain PTB-XL superclass names: NORM, MI, STTC, CD, HYP.
+    Images that fail quality checks or extraction are counted separately and
+    excluded from classifier metrics rather than being silently scored.
+    """
+    if len(image_paths) != len(labels):
+        raise ValueError("image_paths and labels must have the same length")
+
+    from src.ecg.image_to_signal import extract_signal_from_image
+    from src.ecg.interface import predict
+
+    valid_labels = set(LABEL_TO_IDX)
+    unknown = sorted(set(labels) - valid_labels)
+    if unknown:
+        raise ValueError(f"Unknown labels: {unknown}; expected {sorted(valid_labels)}")
+
+    y_true, y_probs = [], []
+    failures = []
+    for image_path, label in zip(image_paths, labels):
+        try:
+            extraction = extract_signal_from_image(image_path)
+            if not extraction.get("success"):
+                failures.append({"path": str(image_path), "reason": extraction.get("message")})
+                continue
+            predicted, confidence, _, _, probabilities = predict(
+                extraction["signal"],
+                return_gradcam=False,
+                return_model_used=True,
+                return_probabilities=True,
+            )
+            y_true.append(LABEL_TO_IDX[label])
+            y_probs.append(np.asarray(probabilities, dtype=np.float32))
+        except Exception as exc:
+            failures.append({"path": str(image_path), "reason": str(exc)})
+
+    result = {
+        "total_images": len(image_paths),
+        "evaluated_images": len(y_true),
+        "failed_images": failures,
+        "failure_count": len(failures),
+    }
+    if y_true:
+        result["metrics"] = compute_metrics(np.asarray(y_true), np.asarray(y_probs))
+    else:
+        result["metrics"] = None
+
+    if output_path:
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "w") as file:
+            json.dump(result, file, indent=2)
+    return result
 
 
 def evaluate_all_models(
