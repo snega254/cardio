@@ -1,0 +1,48 @@
+# Core data
+numpy>=1.24.0,<2.0.0
+pandas>=2.0.0
+scipy>=1.11.0
+scikit-learn>=1.3.0
+matplotlib>=3.7.0
+seaborn>=0.13.0
+
+# Deep Learning
+torch>=2.0.0
+torchvision>=0.15.0
+
+# ECG
+wfdb>=4.0.0
+neurokit2>=0.2.0
+
+# RAG
+faiss-cpu>=1.7.4
+sentence-transformers>=2.6.0,<4.0.0
+
+# LangChain (pinned for compatibility)
+pydantic>=2.7,<3.0
+langchain==0.3.30
+langchain-core==0.3.86
+langchain-community==0.3.31
+langchain-google-genai==2.1.12
+langchain-text-splitters==0.3.11
+
+# App
+streamlit>=1.32.0
+python-dotenv>=1.0.0
+pymongo>=4.6.0
+fpdf2>=2.7.0
+plotly>=5.18.0
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+
+# Utilities
+tqdm>=4.65.0
+typing-extensions>=4.5.0
+
+
+PyMuPDF
+pypdf
+pillow
+opencv-python

@@ -51,6 +51,15 @@ predicted_class, confidence, gradcam_map = predict(raw_12_lead_signal)
 # gradcam_map: np.ndarray, same length as the signal, importance over time
 ```
 
+## Image-to-signal caching
+
+Successful ECG image conversions are cached by image contents in
+`data/ecg_signal_cache/`. Reusing the same image skips the external
+ECG-Digitiser and returns the cached `(1000, 8)` signal. Set
+`ECG_SIGNAL_CACHE_DIR` to use another cache location. Pass
+`use_cache=False` to `extract_signal_from_image()` when a fresh conversion
+is required.
+
 ## File map
 
 | File | Purpose |
