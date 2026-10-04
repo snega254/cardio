@@ -50,15 +50,18 @@ TARGET_LEADS = [
 ]
 
 TARGET_FS = 100
-TARGET_DURATION_SECONDS = 10
-TARGET_LENGTH = TARGET_FS * TARGET_DURATION_SECONDS
+TARGET_DURATION_SECONDS = 2.5
+TARGET_LENGTH = 1000
 
 # Official ECG-Digitiser configuration currently uses:
 # FREQUENCY = 500
 # IMAGE_TYPE = "png"
 DIGITISER_FS = 500
 DIGITISER_TIMEOUT_SECONDS = int(
-    os.getenv("ECG_DIGITISER_TIMEOUT_SECONDS", "180")
+    os.getenv("ECG_DIGITISER_TIMEOUT_SECONDS", "600")
+)
+DIGITISER_IMAGE_SCALE = float(
+    os.getenv("ECG_DIGITISER_IMAGE_SCALE", "1.0")
 )
 
 DEFAULT_CACHE_DIR = (
@@ -178,8 +181,26 @@ def _prepare_png_input(
         with Image.open(source) as image:
             # ECG-Digitiser ultimately reads the image using torchvision.
             # RGB keeps the image compatible with its expected image input.
-            if image.mode not in ("RGB", "RGBA"):
-                image = image.convert("RGB")
+            image = image.convert("RGB")
+            scale = DIGITISER_IMAGE_SCALE
+            if not 0 < scale <= 1:
+                raise ValueError(
+                    "ECG_DIGITISER_IMAGE_SCALE must be greater than 0 "
+                    "and no greater than 1."
+                )
+
+            # IMPORTANT: the pretrained ECG-Digitiser segmentation model
+            # expects the ECG page at approximately the original resolution.
+            # Downscaling the page to 1/3 can erase thin ECG traces and lead
+            # labels, causing the digitizer to return incomplete leads.
+            # Keep the original resolution by default (scale=1.0).
+            if scale != 1.0:
+                width = max(1, round(image.width * scale))
+                height = max(1, round(image.height * scale))
+                image = image.resize(
+                    (width, height),
+                    Image.Resampling.LANCZOS,
+                )
 
             image.save(output_path, format="PNG")
 
@@ -257,6 +278,70 @@ def _save_cached_signal(
 
 
 # ---------------------------------------------------------------------------
+# Signal validation  ── FIX 1 ──
+# ---------------------------------------------------------------------------
+
+def _validate_raw_signal(
+    raw_signal: np.ndarray,
+    signal_names: list,
+    source_fs: float,
+) -> str:
+    """
+    Return '' if the raw digitiser signal looks usable.
+    Otherwise return a human-readable reason it must be rejected.
+
+    Rejects:
+      - signals far shorter than the expected duration (time axis unreliable)
+      - leads that are mostly exactly-zero (NaN-padded by the digitiser)
+      - leads that are flat (std ~ 0)
+      - leads with huge discontinuities (NaN->0 boundary artifacts)
+    """
+    if raw_signal.ndim != 2 or raw_signal.shape[1] == 0:
+        return f"empty signal shape {raw_signal.shape}"
+
+    # 1) Duration / sample-count check
+    expected = int(source_fs * TARGET_DURATION_SECONDS)
+    if expected > 0 and raw_signal.shape[0] < 0.7 * expected:
+        return (
+            f"only {raw_signal.shape[0]} samples at {source_fs} Hz "
+            f"(expected ~{expected}) — time axis unreliable"
+        )
+
+    # 2) Per-lead zero-fraction + flatness
+    for i, name in enumerate(signal_names):
+        col = raw_signal[:, i].astype(np.float64)
+        zero_frac = float(np.mean(np.isclose(col, 0.0, atol=1e-6)))
+        if zero_frac > 0.05:
+            return (
+                f"lead {name} is {zero_frac:.0%} zeros — "
+                f"NaN padding from digitiser"
+            )
+        if float(np.nanstd(col)) < 1e-4:
+            return f"lead {name} is flat (std={float(np.nanstd(col)):.2e})"
+
+    # 3) Discontinuity check
+        # 3) Discontinuity check
+    #    QRS spikes are legitimately 30-100x the baseline noise, so a
+    #    50x threshold produces false positives. A genuine digitiser
+    #    glitch (trace jumping across the page) is typically >500x.
+    #    We use 200x as a compromise.
+    for i, name in enumerate(signal_names):
+        col = raw_signal[:, i].astype(np.float64)
+        d = np.abs(np.diff(col))
+        nonzero = d[d > 0]
+        if nonzero.size == 0:
+            continue
+        med = float(np.median(nonzero))
+        if med > 0 and float(d.max()) > 200 * med:
+            return (
+                f"lead {name} has a discontinuity "
+                f"(max step {float(d.max()):.3f}, median {med:.3f})"
+            )
+
+    return ""
+
+
+# ---------------------------------------------------------------------------
 # Run official ECG-Digitiser
 # ---------------------------------------------------------------------------
 
@@ -316,23 +401,11 @@ def _run_external_digitiser(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        # ---------------------------------------------------------------
-        # IMPORTANT FIX:
-        #
-        # ECG-Digitiser/config.py has:
-        #
-        #     IMAGE_TYPE = "png"
-        #
-        # Therefore JPG/JPEG must be converted to PNG before running
-        # the official digitizer.
-        # ---------------------------------------------------------------
-
         png_input = _prepare_png_input(
             image_path,
             input_dir,
         )
 
-        # Verify that the exact file the digitizer will search for exists.
         png_files = list(input_dir.glob("*.png"))
 
         if not png_files:
@@ -343,10 +416,6 @@ def _run_external_digitiser(
                     "ECG-Digitiser requires .png input."
                 ),
             }
-
-        # ---------------------------------------------------------------
-        # Run the official ECG-Digitiser command.
-        # ---------------------------------------------------------------
 
         command = [
             sys.executable,
@@ -363,10 +432,6 @@ def _run_external_digitiser(
 
         env = os.environ.copy()
 
-        # Keep the repository importable when running:
-        #
-        #     python -m src.run.digitize
-        #
         env["PYTHONPATH"] = os.pathsep.join(
             [
                 str(repo_root),
@@ -374,13 +439,14 @@ def _run_external_digitiser(
             ]
         ).rstrip(os.pathsep)
 
-        # Make the local Python environment available to subprocesses.
         env["PATH"] = os.pathsep.join(
             [
                 str(Path(sys.executable).parent),
                 env.get("PATH", ""),
             ]
         )
+
+        env["nnUNet_results"] = str(model_dir / "nnUNet_results")
 
         try:
             completed = subprocess.run(
@@ -429,10 +495,6 @@ def _run_external_digitiser(
             )
             return None, metadata
 
-        # ---------------------------------------------------------------
-        # Find the WFDB output generated by ECG-Digitiser.
-        # ---------------------------------------------------------------
-
         header_files = sorted(output_dir.glob("*.hea"))
 
         if not header_files:
@@ -458,12 +520,6 @@ def _run_external_digitiser(
 
     finally:
         # The WFDB file is read before this temporary directory is removed.
-        #
-        # _run_external_digitiser returns the header path only when this
-        # function succeeds, so cleanup must happen AFTER the caller has
-        # loaded the WFDB data.
-        #
-        # Therefore cleanup is intentionally NOT performed here.
         pass
 
 
@@ -544,13 +600,14 @@ def _select_target_leads(
 
     Missing leads are treated as an error.
 
-    We do NOT create missing leads using mathematical derivation or
-    zero-filling because the ECG-Digitiser output itself should provide
-    the required leads.
+    ── FIX 2 ──
+    After name-matching, also verify each selected lead actually contains
+    a non-degenerate signal (not flat, not mostly zeros). This catches the
+    case where the digitiser emits a lead name but its mask failed, which
+    produces a NaN-padded -> zero-filled column.
     """
 
     indices = []
-
     missing = []
 
     for lead in TARGET_LEADS:
@@ -566,9 +623,11 @@ def _select_target_leads(
 
     if missing:
         raise ValueError(
-            "ECG-Digitiser WFDB output is missing required leads: "
+            "ECG image digitization produced an incomplete WFDB record. "
+            "The required leads exist in the source ECG page, but the "
+            "digitizer did not export them. Missing: "
             + ", ".join(missing)
-            + f". Available leads: {signal_names}"
+            + f". Available WFDB leads: {signal_names}"
         )
 
     selected = signal[:, indices]
@@ -577,6 +636,23 @@ def _select_target_leads(
         raise ValueError(
             "Unexpected number of selected ECG leads: "
             f"{selected.shape}"
+        )
+
+    # ── FIX 2 (content check) ──
+    degenerate = []
+    for i, lead in enumerate(TARGET_LEADS):
+        col = selected[:, i].astype(np.float64)
+        zero_frac = float(np.mean(np.isclose(col, 0.0, atol=1e-6)))
+        if zero_frac > 0.05 or float(np.nanstd(col)) < 1e-4:
+            degenerate.append(
+                f"{lead}(zero={zero_frac:.0%},std={float(np.nanstd(col)):.2e})"
+            )
+
+    if degenerate:
+        raise ValueError(
+            "Digitiser produced flat or zero-filled leads: "
+            + ", ".join(degenerate)
+            + f". Available WFDB leads: {signal_names}"
         )
 
     return selected.astype(np.float32)
@@ -611,7 +687,6 @@ def _resample_signal(
     if np.isclose(source_fs, target_fs):
         return signal.astype(np.float32)
 
-    # Find an exact rational representation for the ratio.
     from fractions import Fraction
 
     ratio = Fraction(
@@ -645,16 +720,11 @@ def _prepare_model_length(
     """
     Prepare the digitized signal for the fixed-size CardioAgent model.
 
-    If the digitizer produces:
-        10 sec -> 1000 samples after resampling: unchanged.
-
-    If it produces a shorter record:
-        pad using the final available sample.
-
-    If it produces a longer record:
-        crop to target_length.
-
-    No waveform is synthesized.
+    ── FIX 3 ──
+    Previously this padded a short signal by repeating its last sample,
+    which created a large DC step (and corrupted per-lead z-scoring in
+    preprocess_signal). Now we pad with the per-lead mean, which is a
+    neutral value that does not introduce a discontinuity.
     """
 
     if signal.ndim != 2:
@@ -677,13 +747,9 @@ def _prepare_model_length(
 
     pad_length = target_length - current_length
 
-    last_sample = signal[-1:, :]
-
-    padding = np.repeat(
-        last_sample,
-        pad_length,
-        axis=0,
-    )
+    # ── FIX 3 (mean padding instead of last-sample padding) ──
+    per_lead_mean = signal.mean(axis=0, keepdims=True)
+    padding = np.repeat(per_lead_mean, pad_length, axis=0)
 
     return np.concatenate(
         [signal, padding],
@@ -712,11 +778,13 @@ def extract_signal_from_image(
             ↓
         WFDB
             ↓
-        select I, II, V1-V6
+        validate raw signal  ← FIX 1
+            ↓
+        select I, II, V1-V6 (with content check)  ← FIX 2
             ↓
         resample 500 Hz -> 100 Hz
             ↓
-        prepare 1000 samples
+        prepare 1000 samples (mean padding)  ← FIX 3
             ↓
         CardioAgent ECG model
 
@@ -732,7 +800,9 @@ def extract_signal_from_image(
             "error": f"ECG image not found: {image_path}",
         }
 
-    if use_cache:
+    force_redigitize = os.getenv("ECG_FORCE_REDIGITIZE", "0") == "1"
+
+    if use_cache and not force_redigitize:
         cached_result = _load_cached_signal(image_path)
         if cached_result is not None:
             return cached_result
@@ -743,10 +813,6 @@ def extract_signal_from_image(
     temp_root: Optional[Path] = None
 
     try:
-        # ---------------------------------------------------------------
-        # Run official ECG-Digitiser
-        # ---------------------------------------------------------------
-
         repo_root = _find_external_digitiser_repo()
 
         if repo_root is None:
@@ -783,8 +849,6 @@ def extract_signal_from_image(
                 ),
             }
 
-        # Create our own temporary working directory here so that the
-        # WFDB output remains available until after we read it.
         temp_root = Path(
             tempfile.mkdtemp(
                 prefix="cardioagent_digitiser_"
@@ -797,7 +861,6 @@ def extract_signal_from_image(
         input_dir.mkdir(parents=True, exist_ok=True)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Convert JPG/JPEG/etc. to PNG for the official digitizer.
         png_input = _prepare_png_input(
             image_path,
             input_dir,
@@ -830,6 +893,36 @@ def extract_signal_from_image(
                 str(Path(sys.executable).parent),
                 env.get("PATH", ""),
             ]
+        )
+
+        env["nnUNet_results"] = str(model_dir / "nnUNet_results")
+
+        nnunet_exe = shutil.which("nnUNetv2_predict", path=env.get("PATH"))
+        if nnunet_exe is None:
+            digitiser_metadata = {
+                "success": False,
+                "error": (
+                    "nnUNetv2_predict was not found in the active Python environment. "
+                    "Install the ECG-Digitiser bundled/patched nnUNet package "
+                    "before running image digitization."
+                ),
+                "digitiser_repo": str(repo_root),
+                "digitiser_model": str(model_dir),
+                "digitiser_input_png": str(png_input),
+            }
+            return {
+                "success": False,
+                "signal": None,
+                "error": digitiser_metadata["error"],
+                "metadata": digitiser_metadata,
+            }
+
+        logger.info("Using nnUNetv2_predict: %s", nnunet_exe)
+        logger.info(
+            "ECG-Digitiser input PNG: %s (%d x %d)",
+            png_input,
+            Image.open(png_input).size[0],
+            Image.open(png_input).size[1],
         )
 
         try:
@@ -879,8 +972,13 @@ def extract_signal_from_image(
         }
 
         if completed.returncode != 0:
+            stderr_tail = (completed.stderr or "").strip()[-2000:]
+            stdout_tail = (completed.stdout or "").strip()[-1000:]
             digitiser_metadata["error"] = (
-                "ECG-Digitiser returned a non-zero exit code."
+                "ECG-Digitiser returned a non-zero exit code "
+                f"({completed.returncode}).\n"
+                f"STDERR:\n{stderr_tail}\n"
+                f"STDOUT:\n{stdout_tail}"
             )
 
             return {
@@ -889,10 +987,6 @@ def extract_signal_from_image(
                 "error": digitiser_metadata["error"],
                 "metadata": digitiser_metadata,
             }
-
-        # ---------------------------------------------------------------
-        # Locate WFDB output
-        # ---------------------------------------------------------------
 
         header_files = sorted(
             output_dir.glob("*.hea")
@@ -932,14 +1026,34 @@ def extract_signal_from_image(
         digitiser_metadata["raw_signal_names"] = signal_names
         digitiser_metadata["raw_sampling_rate"] = source_fs
 
+        # ── FIX 1: validate raw signal before we trust it ──
+        reason = _validate_raw_signal(raw_signal, signal_names, source_fs)
+        if reason:
+            digitiser_metadata["validation_error"] = reason
+            return {
+                "success": False,
+                "signal": None,
+                "error": f"Digitiser produced an invalid signal: {reason}",
+                "metadata": digitiser_metadata,
+            }
+
         # ---------------------------------------------------------------
-        # Select exact 8 model leads
+        # Select exact 8 model leads (with content check)
         # ---------------------------------------------------------------
 
-        selected_signal = _select_target_leads(
-            raw_signal,
-            signal_names,
-        )
+        try:
+            selected_signal = _select_target_leads(
+                raw_signal,
+                signal_names,
+            )
+        except ValueError as exc:
+            digitiser_metadata["lead_selection_error"] = str(exc)
+            return {
+                "success": False,
+                "signal": None,
+                "error": str(exc),
+                "metadata": digitiser_metadata,
+            }
 
         digitiser_metadata["selected_leads"] = list(
             TARGET_LEADS
@@ -961,7 +1075,7 @@ def extract_signal_from_image(
         )
 
         # ---------------------------------------------------------------
-        # Prepare fixed model length
+        # Prepare fixed model length (mean padding)
         # ---------------------------------------------------------------
 
         model_signal = _prepare_model_length(
@@ -1056,8 +1170,6 @@ def extract_signal_from_image(
         }
 
     finally:
-        # The WFDB data has already been loaded by this point.
-        # It is safe to remove the temporary digitizer directory.
         if temp_root is not None:
             shutil.rmtree(
                 temp_root,
@@ -1074,13 +1186,6 @@ def image_to_signal(
 ) -> Dict[str, Any]:
     """
     Backward-compatible wrapper.
-
-    Existing CardioAgent code can continue calling:
-
-        image_to_signal(path)
-
-    while the actual implementation remains
-    extract_signal_from_image().
     """
 
     return extract_signal_from_image(image_path)

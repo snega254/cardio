@@ -166,6 +166,8 @@ def predict_mask_nnunet(image, dataset_name, model_folder):
 
     # Set env variabels (nnUNet needs them to be set)
     os.environ["nnUNet_results"] = os.path.join(model_folder, "nnUNet_results")
+    os.environ.setdefault("nnUNet_raw", os.path.join(model_folder, "nnUNet_raw"))
+    os.environ.setdefault("nnUNet_preprocessed", os.path.join(model_folder, "nnUNet_preprocessed"))
 
     # Create temp folders and copy image
     shutil.rmtree(temp_folder_input, ignore_errors=True)
@@ -175,12 +177,34 @@ def predict_mask_nnunet(image, dataset_name, model_folder):
     write_png(image, image_path_temp)
 
     # Run inference
-    if torch.cuda.is_available():
-        command_run = f"nnUNetv2_predict -d {dataset_name} -i {temp_folder_input} -o {temp_folder_output} -f all -tr nnUNetTrainer -c 2d -p nnUNetPlans"
-    else:
+    nnunet_executable = os.path.join(
+        os.path.dirname(sys.executable),
+        "nnUNetv2_predict.exe" if os.name == "nt" else "nnUNetv2_predict",
+    )
+    if not os.path.isfile(nnunet_executable):
+        nnunet_executable = "nnUNetv2_predict"
+
+    command_run = [
+        nnunet_executable,
+        "-d", dataset_name,
+        "-i", temp_folder_input,
+        "-o", temp_folder_output,
+        "-f", "all",
+        "-tr", "nnUNetTrainer",
+        "-c", "2d",
+        "-p", "nnUNetPlans",
+    ]
+    if not torch.cuda.is_available():
         print("CUDA not available. Running on CPU.")
-        command_run = f"nnUNetv2_predict -d {dataset_name} -i {temp_folder_input} -o {temp_folder_output} -f all -tr nnUNetTrainer -c 2d -p nnUNetPlans -device cpu --verbose"
-    subprocess.run(command_run, shell=True)
+        command_run.extend([
+            "-device", "cpu",
+            "--disable_tta",
+            "-npp", "1",          # ── FIX: 1 preprocessing worker instead of default
+            "-nps", "1",          # ── FIX: 1 segmentation worker instead of default
+            "--verbose",
+        ])
+
+    subprocess.run(command_run, check=True)
 
     # Get masks
     mask = read_image(mask_path_temp)
@@ -232,7 +256,7 @@ def cut_binary(mask_to_use, image_rotated):
 
 
 def vectorise(
-    image_rotated, mask, signal_cropped, sec_per_pixel, mV_per_pixel, y_shift_ratio, lead
+    image_rotated, mask, signal_y1, sec_per_pixel, mV_per_pixel, y_shift_ratio, lead
 ):
     """Vectorise the image."""
 
@@ -248,16 +272,24 @@ def vectorise(
 
     # Scale y
     # The code aligns and scales a signal based on a mask's non-zero regions and a vertical shift ratio. It computes the mean vertical position of non-zero elements in the mask, adjusts the signal's vertical position using y_shift_ratio_, and scales the result into physical units (e.g., millivolts) for further analysis.
-    non_zero_mean = torch.tensor(
-        [
-            torch.mean(torch.nonzero(mask[0, :, i]).type(torch.float32))
-            for i in range(mask.shape[2])
-        ]
-    )
-    signal_cropped_shifted = (1 - y_shift_ratio_) * image_rotated.shape[
-        1
-    ] - signal_cropped
-    predicted_signal = (signal_cropped_shifted - non_zero_mean) * mV_per_pixel
+    column_centers = []
+    previous_center = None
+    for column in range(mask.shape[2]):
+        rows = torch.where(mask[0, :, column] > 0)[0]
+        if len(rows) == 0:
+            if previous_center is None:
+                column_centers.append(torch.tensor(0.0))
+            else:
+                column_centers.append(previous_center)
+            continue
+        center = rows.float().mean()
+        column_centers.append(center)
+        previous_center = center
+
+    local_y = torch.stack(column_centers)
+    global_y = local_y + float(signal_y1)
+    baseline_y = (1 - y_shift_ratio_) * image_rotated.shape[1]
+    predicted_signal = (baseline_y - global_y) * mV_per_pixel
 
     # Scale x
     # The code reshapes the predicted signal into a 3D tensor for interpolation and resamples it to a specified size using linear interpolation. It then flattens the resampled data back into a 1D tensor for further use.
@@ -349,6 +381,8 @@ def run(args):
 
         # Rotate
         rot_angle = get_rotation_angle(image.permute(1, 2, 0).numpy().astype(np.uint8))
+        if not np.isfinite(rot_angle):
+            rot_angle = 0
         image_rotated = rotate(image, rot_angle)
 
         # Segment
@@ -364,9 +398,14 @@ def run(args):
             v.shape[2] for v in signal_masks_cropped.values() if v is not None
         ]
         x_pixel_list_median = np.median(x_pixel_list)
-        x_pixel_list_below_2x_median_mean = np.mean(
-            [v for v in x_pixel_list if v < 2 * x_pixel_list_median]
-        )
+        usable_widths = [
+            v for v in x_pixel_list if v < 2 * x_pixel_list_median
+        ]
+        if not usable_widths:
+            raise ValueError(
+                f"No usable ECG lead masks were detected for record {record}."
+            )
+        x_pixel_list_below_2x_median_mean = np.mean(usable_widths)
         sec_per_pixel = 2.5 / x_pixel_list_below_2x_median_mean
         mm_per_pixel = 25 * sec_per_pixel
         sec_per_pixel = mm_per_pixel / 25
@@ -392,17 +431,43 @@ def run(args):
             for signal_name in LEAD_LABEL_MAPPING.keys()
             if signals_predicted[signal_name] is not None
         }
-        num_samples = int(LONG_SIGNAL_LENGTH_SEC * FREQUENCY)
+        num_samples = int(SHORT_SIGNAL_LENGTH_SEC * FREQUENCY)
         signal_list = []
-        for signal in signals.values():
+        sig_names = []
+        for signal_name, signal in signals.items():
+            # ── FIX: guard against an empty (zero-length) extracted lead ──
+            if len(signal) == 0:
+                print(
+                    f"Skipping lead '{signal_name}' for record {record}: "
+                    f"empty signal extracted."
+                )
+                continue
+
             if len(signal) < num_samples:
                 nan_signal = np.empty(num_samples)
                 nan_signal[:] = np.nan
                 nan_signal[: int(len(signal))] = signal
                 signal_list.append(nan_signal)
+            elif len(signal) > num_samples:
+                # ── FIX: truncate leads that are longer than num_samples
+                # (e.g. a full-width rhythm strip resampled at
+                # LONG_SIGNAL_LENGTH_SEC) so every lead has the same length
+                # before stacking into a single 2D array. Note: this drops
+                # the tail of any long lead beyond num_samples/FREQUENCY
+                # seconds.
+                signal_list.append(signal[:num_samples])
             else:
                 signal_list.append(signal)
-        sig_names = list(signals.keys())
+
+            sig_names.append(signal_name)
+
+        if not signal_list:
+            print(f"=========== No usable leads for record {record}. ===========")
+            if args.allow_failures:
+                continue
+            else:
+                raise ValueError(f"No usable leads extracted for record {record}.")
+
         signals = np.array(signal_list).T
 
         # Check if signal is empty
