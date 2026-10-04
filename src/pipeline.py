@@ -1,6 +1,11 @@
 """
 CardioAgent Pipeline - Full end-to-end.
 TRIAGE-ACTION version: accepts past_records, returns action + reason + conditions.
+
+UPDATED:
+  - Removed low-confidence downgrade. The reasoner's action is used as-is.
+  - Removed "low-confidence (X%)" prepended text from reason.
+  - The final action logged == the final action returned. No more mismatch.
 """
 
 import os
@@ -62,8 +67,6 @@ ECG_CLASS_TO_TERMS = {
     "HYP":  "hypertrophy",
 }
 
-ECG_LOW_CONFIDENCE_THRESHOLD = 0.60
-
 
 def run_pipeline(
     raw_symptom_text,
@@ -88,7 +91,9 @@ def run_pipeline(
         "conditions": [],
     }
 
+    # ---------------------------------------------------------------
     # Step 1: Symptom extraction
+    # ---------------------------------------------------------------
     report("Step 1: Extracting symptoms")
     try:
         symptoms = extract_symptoms(raw_symptom_text)
@@ -107,13 +112,16 @@ def run_pipeline(
         }
     result["extracted_symptoms"] = symptoms
 
-    # Step 2: ECG
+    # ---------------------------------------------------------------
+    # Step 2: ECG extraction
+    # ---------------------------------------------------------------
     ecg_findings = {}
     ecg_meta = {"predicted_class": "N/A", "confidence": 0.0, "source": None}
     signal_to_use = None
 
     if ecg_image_path is not None:
         report("Step 2: Processing ECG image")
+        ecg_meta["source"] = "image"
         try:
             extraction = extract_signal_from_image(ecg_image_path)
             if extraction.get("success"):
@@ -122,7 +130,6 @@ def run_pipeline(
                 ecg_meta["image_quality"] = extraction.get("quality")
                 ecg_meta["lead_detection"] = extraction.get("lead_detection")
                 ecg_meta["features"] = extraction.get("features")
-                ecg_meta["source"] = "image"
                 report(
                     f"Step 2 complete: ECG image converted to signal "
                     f"(shape {signal_to_use.shape})"
@@ -133,6 +140,11 @@ def run_pipeline(
                     or extraction.get("message")
                     or "ECG image extraction failed without a diagnostic message."
                 )
+                inner_meta = extraction.get("metadata") or {}
+                if inner_meta.get("validation_error"):
+                    ecg_meta["validation_error"] = inner_meta["validation_error"]
+                if inner_meta.get("lead_selection_error"):
+                    ecg_meta["lead_selection_error"] = inner_meta["lead_selection_error"]
                 logger.warning(f"Image extraction failed: {ecg_meta['extraction_error']}")
                 report(f"Step 2 warning: ECG image processing failed: {ecg_meta['extraction_error']}")
         except Exception as e:
@@ -148,6 +160,14 @@ def run_pipeline(
     else:
         report("Step 2 skipped: No ECG image or signal provided")
 
+    if signal_to_use is None:
+        ecg_findings = {}
+        ecg_meta.setdefault("predicted_class", "N/A")
+        ecg_meta.setdefault("confidence", 0.0)
+
+    # ---------------------------------------------------------------
+    # Step 3: ECG classifier
+    # ---------------------------------------------------------------
     if signal_to_use is not None:
         report("Step 3: Running ECG classifier")
         try:
@@ -172,10 +192,7 @@ def run_pipeline(
             ecg_meta["confidence"] = float(confidence)
             ecg_meta["model_used"] = model_used
 
-            report(
-                f"Step 3 complete: ECG classified as {predicted_class} "
-                f"({float(confidence):.3f})"
-            )
+            report(f"Step 3 complete: ECG classified as {predicted_class}")
         except Exception as e:
             logger.error(f"ECG model crashed: {e}", exc_info=True)
             ecg_meta["classifier_error"] = str(e)
@@ -185,7 +202,9 @@ def run_pipeline(
 
     result["ecg_analysis"] = ecg_meta
 
-    # Step 3: Build RAG query
+    # ---------------------------------------------------------------
+    # Step 4: Build RAG query
+    # ---------------------------------------------------------------
     query_parts = list(symptoms.get("symptom_list", []))[:3]
     ecg_class = ecg_findings.get("class")
     if ecg_class and ecg_class != "NORM":
@@ -194,7 +213,9 @@ def run_pipeline(
     report("Step 4: Building evidence search query")
     logger.info(f"RAG query: {query[:120]}")
 
-    # Step 4: RAG retrieval
+    # ---------------------------------------------------------------
+    # Step 5: RAG retrieval
+    # ---------------------------------------------------------------
     report("Step 5: Retrieving clinical evidence")
     try:
         evidence = retrieve(query, top_k=top_k_retrieval)
@@ -214,7 +235,9 @@ def run_pipeline(
         for e in evidence[:3]
     ]
 
-    # Step 5: Reasoning (with smart fallback)
+    # ---------------------------------------------------------------
+    # Step 6: Clinical reasoning
+    # ---------------------------------------------------------------
     report("Step 6: Generating clinical triage")
     try:
         reasoning = reason(symptoms, ecg_findings, evidence, past_records=past_records)
@@ -224,46 +247,34 @@ def run_pipeline(
     except Exception as e:
         logger.error(f"Reasoning failed: {e}")
         report(f"Step 6 warning: Clinical reasoning failed: {e}")
-        result["reason"] = f"Reasoning service unavailable: {str(e)[:100]}"
+        result["reason"] = "Clinical reasoning service unavailable."
 
-        # --- Smart fallback based on ECG findings ---
         fb_class = ecg_findings.get("class", "NORM")
         fb_conf = ecg_findings.get("confidence", 0.0)
 
         if fb_class == "MI" and fb_conf >= 0.5:
             result["action"] = "Immediate Visit"
             result["reason"] = (
-                f"ECG model detected MI (heart attack) at {fb_conf:.0%} "
-                "confidence. AI reasoning service unavailable, but the ECG "
-                "finding alone warrants immediate emergency evaluation."
+                "ECG finding suggests a possible myocardial infarction. "
+                "Immediate emergency evaluation is advised."
             )
         elif fb_class in ("STTC", "CD", "HYP") and fb_conf >= 0.5:
             result["action"] = "Checkup"
             result["reason"] = (
-                f"ECG model detected {fb_class} at {fb_conf:.0%} confidence. "
-                "AI reasoning service unavailable; recommend clinical follow-up."
+                "ECG finding suggests a possible abnormality. "
+                "Clinical follow-up is recommended."
             )
         else:
             result["action"] = "Checkup"
 
-    report(f"Step 6 complete: Triage action is {result['action']}")
-    ecg_class = ecg_findings.get("class", "NORM")
-    ecg_conf = ecg_findings.get("confidence", 0.0)
-    if ecg_class not in (None, "NORM", "N/A") and ecg_conf < ECG_LOW_CONFIDENCE_THRESHOLD:
-        if result["action"] == "Immediate Visit":
-            result["action"] = "Checkup"
-            result["reason"] = (
-                f"ECG abnormality is low-confidence ({ecg_conf:.0%}); the waveform is uncertain and should be reviewed with a higher-quality ECG before emergency escalation. "
-                f"{result.get('reason', '')}"
-            ).strip()
-        else:
-            result["reason"] = (
-                f"ECG abnormality is low-confidence ({ecg_conf:.0%}); this is an uncertain ECG finding and requires a confirmatory review rather than urgent escalation. "
-                f"{result.get('reason', '')}"
-            ).strip()
-
+    # ---------------------------------------------------------------
+    # Final triage action — uses the reasoner's decision directly.
+    # No confidence-based downgrade, no prepended warning text.
+    # ---------------------------------------------------------------
     if result["action"] not in {"Immediate Visit", "Checkup", "No Action"}:
         result["action"] = "Checkup"
+
+    report(f"Step 6 complete: Triage action is {result['action']}")
 
     result["pipeline_status"] = "complete"
     logger.info(f"Pipeline complete. Action: {result['action']}")

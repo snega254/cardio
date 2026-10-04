@@ -88,6 +88,13 @@ def train_model(
     model = model_cls(
         in_channels=train_ds.input_channels, num_classes=train_ds.num_classes
     ).to(device)
+    model_cls = MODEL_REGISTRY[model_name]
+    model = model_cls(in_channels=train_ds.input_channels, num_classes=train_ds.num_classes
+    ).to(device)
+
+    # Quick sanity check — confirm the shape the model will see
+    _x_sample, _ = train_ds[0]
+    print(f"  input shape: {tuple(_x_sample.shape)}  (channels, samples)")
 
     criterion = nn.CrossEntropyLoss()
     # weight_decay adds L2 regularization to combat overfitting

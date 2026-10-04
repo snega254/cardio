@@ -1,6 +1,13 @@
 """
 CardioAgent - Triage app.
 Structured symptoms + optional ECG -> triage action.
+
+UPDATED:
+  - Removed confidence metric from Summary.
+  - Removed ECG image quality pass/fail banner.
+  - Removed evidence retrieval scores.
+  - Removed "Conditions" metric from Summary.
+  - Summary now shows only: ECG Class and (optional) a plain status.
 """
 
 import sys
@@ -182,7 +189,7 @@ other_symptoms = st.text_area(
 # ---------- ECG Upload ----------
 ecg_file = st.file_uploader(
     "ECG image",
-    type=["jpg", "jpeg", "png", "pdf"],
+    type=["jpg", "jpeg", "png"],
 )
 
 run_clicked = st.button("Run Analysis", use_container_width=True)
@@ -277,33 +284,16 @@ if run_clicked:
         st.markdown("#### Why this action")
         st.markdown(f'<div class="box">{reason}</div>', unsafe_allow_html=True)
 
-    # ---------- METRICS ----------
+    # ---------- ECG STATUS ----------
     ecg_meta = result.get("ecg_analysis", {})
     ecg_class = ecg_meta.get("predicted_class", "N/A")
-    ecg_conf = ecg_meta.get("confidence", 0.0)
-
     extraction_error = ecg_meta.get("extraction_error")
+
     if extraction_error:
         st.error(f"ECG image analysis failed: {extraction_error}")
-
-    if ecg_meta.get("source") == "image":
-        quality = ecg_meta.get("image_quality") or {}
-        if quality.get("passed"):
-            st.success("ECG image passed quality checks and was converted to a signal.")
-        else:
-            st.warning("ECG image quality checks did not pass; interpret the result cautiously.")
-
-    st.markdown("#### Summary")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("ECG Class", ecg_class if ecg_class != "N/A" else "No ECG")
-    with col2:
-        if ecg_class not in ("N/A", None, "") and ecg_conf > 0:
-            st.metric("ECG Confidence", f"{ecg_conf * 100:.0f}%")
-        else:
-            st.metric("ECG Confidence", "-")
-    with col3:
-        st.metric("Conditions", len(result.get("conditions", [])))
+    elif ecg_meta.get("source") == "image":
+        # No pass/fail message — just silently note the source
+        pass
 
     # ---------- SYMPTOMS (from pipeline) ----------
     symptoms = result.get("extracted_symptoms", {})
@@ -328,19 +318,18 @@ if run_clicked:
         for c in conditions:
             st.markdown(f'<div class="pill">{c}</div>', unsafe_allow_html=True)
 
-    # ---------- EVIDENCE ----------
+    # ---------- EVIDENCE (sources only, no scores) ----------
     evidence = result.get("retrieved_evidence", [])
     if evidence:
         with st.expander("Guideline evidence used"):
             for e in evidence:
-                score = e.get("score", 0.0)
                 source = e.get("source", "unknown")
                 text = e.get("text", "")
                 st.markdown(
-                    f'<div class="evidence"><b>{source}</b> &nbsp;·&nbsp; score {score:.2f}<br>{text}...</div>',
+                    f'<div class="evidence"><b>{source}</b><br>{text}...</div>',
                     unsafe_allow_html=True,
                 )
 
-    # ---------- RAW JSON ----------
+    # ---------- RAW JSON (hidden expander) ----------
     with st.expander("Full result (JSON)"):
         st.json(result)
