@@ -1,0 +1,7 @@
+debug_full 6 500 5000
+debug_full.dat 16 1000.0(0)/mV 16 0 -426 21411 0 II
+debug_full.dat 16 1000.0(0)/mV 16 0 -876 13277 0 aVL
+debug_full.dat 16 1000.0(0)/mV 16 0 -361 26732 0 aVF
+debug_full.dat 16 1000.0(0)/mV 16 0 0 49424 0 V3
+debug_full.dat 16 1000.0(0)/mV 16 0 0 54144 0 V4
+debug_full.dat 16 1000.0(0)/mV 16 0 -326 7543 0 V5
